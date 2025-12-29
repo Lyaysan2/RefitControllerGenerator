@@ -136,33 +136,26 @@ namespace RefitControllerGenerator.CodeFixes
         /// <returns></returns>
         private static string? TryGetBaseRoute(INamedTypeSymbol interfaceSymbol)
         {
-            var routes = interfaceSymbol
+            var method = interfaceSymbol
                 .GetMembers()
                 .OfType<IMethodSymbol>()
-                .SelectMany(m => m.GetAttributes())
-                .Where(a =>
-                    a.AttributeClass?.Name is "GetAttribute" or "PostAttribute" or "PutAttribute" or "DeleteAttribute")
-                .Select(a => a.ConstructorArguments.FirstOrDefault().Value as string)
-                .Where(r => !string.IsNullOrWhiteSpace(r))
-                .Select(r => r!.Trim('/'))
-                .ToList();
+                .FirstOrDefault();
 
-            if (!routes.Any())
+            if (method == null)
                 return null;
 
-            var split = routes
-                .Select(r => r.Split('/'))
-                .ToList();
+            foreach (var attr in method.GetAttributes())
+            {
+                var ctorArg = attr.ConstructorArguments.FirstOrDefault().Value as string;
+                if (!string.IsNullOrWhiteSpace(ctorArg))
+                {
+                    // Берем всё до последнего '/'
+                    var idx = ctorArg.LastIndexOf('/');
+                    return idx > 0 ? ctorArg.Substring(0, idx + 1) : ctorArg;
+                }
+            }
 
-            var commonSegments = split
-                .First()
-                .TakeWhile((segment, index) =>
-                    split.All(s => s.Length > index && s[index] == segment))
-                .ToArray();
-
-            return commonSegments.Length == 0
-                ? null
-                : string.Join("/", commonSegments);
+            return null;
         }
 
         /// <summary>
@@ -218,7 +211,8 @@ namespace RefitControllerGenerator.CodeFixes
                     GenerateLoggerField(),
                     constructor
                 )
-                .AddMembers(GenerateControllerMethods(interfaceSymbol, baseRoute));
+
+                .AddMembers(GenerateControllerMethods(interfaceSymbol));
 
             var docsTrivia = GenerateControllerDocs(interfaceSymbol);
             if (docsTrivia.Count > 0)
@@ -233,13 +227,13 @@ namespace RefitControllerGenerator.CodeFixes
         /// </summary>
         /// <param name="interfaceSymbol"></param>
         /// <returns></returns>
-        private static MemberDeclarationSyntax[] GenerateControllerMethods(INamedTypeSymbol interfaceSymbol, string baseRoute)
+        private static MemberDeclarationSyntax[] GenerateControllerMethods(INamedTypeSymbol interfaceSymbol)
         {
             return interfaceSymbol
                 .GetMembers()
                 .OfType<IMethodSymbol>()
                 .Where(m => m.MethodKind == MethodKind.Ordinary)
-                .Select(m => GenerateControllerMethod(m, baseRoute))
+                .Select(GenerateControllerMethod)
                 .ToArray();
         }
 
@@ -248,7 +242,7 @@ namespace RefitControllerGenerator.CodeFixes
         /// </summary>
         /// <param name="method"></param>
         /// <returns></returns>
-        private static MethodDeclarationSyntax GenerateControllerMethod(IMethodSymbol method, string baseRoute)
+        private static MethodDeclarationSyntax GenerateControllerMethod(IMethodSymbol method)
         {
             var httpAttr = GetRefitHttpAttribute(method);
             var httpMethod = httpAttr.httpMethod;
@@ -266,7 +260,7 @@ namespace RefitControllerGenerator.CodeFixes
                     .AddParameterListParameters(
                         method.Parameters.Select(GenerateParameter).ToArray())
                     .AddAttributeLists(
-                        GenerateHttpAttribute(httpMethod, route, baseRoute))
+                        GenerateHttpAttribute(httpMethod, route))
                     .AddAttributeLists(
                         GenerateProducesAttributes())
                     .AddAttributeLists(
@@ -508,25 +502,24 @@ namespace RefitControllerGenerator.CodeFixes
         /// <param name="method"></param>
         /// <param name="route"></param>
         /// <returns></returns>
-        private static AttributeListSyntax GenerateHttpAttribute(string method, string? fullRoute, string? baseRoute)
+        private static AttributeListSyntax GenerateHttpAttribute(string method, string? route)
         {
             var attrName = "Http" + method.Substring(0, 1) + method.Substring(1).ToLowerInvariant();
+
             var attr = SyntaxFactory.Attribute(SyntaxFactory.IdentifierName(attrName));
 
-            if (!string.IsNullOrWhiteSpace(fullRoute) && !string.IsNullOrWhiteSpace(baseRoute))
+            if (!string.IsNullOrWhiteSpace(route))
             {
-                var normalized = fullRoute.Trim('/');
-                var remainder = normalized.StartsWith(baseRoute)
-                    ? normalized.Substring(baseRoute.Length).Trim('/')
-                    : normalized;
+                var shortRoute = route.Substring(route.LastIndexOf('/') + 1);
 
-                if (!string.IsNullOrWhiteSpace(remainder))
+                // Если пусто — вообще не добавляем аргумент
+                if (!string.IsNullOrWhiteSpace(shortRoute))
                 {
                     attr = attr.AddArgumentListArguments(
                         SyntaxFactory.AttributeArgument(
                             SyntaxFactory.LiteralExpression(
                                 SyntaxKind.StringLiteralExpression,
-                                SyntaxFactory.Literal(remainder))));
+                                SyntaxFactory.Literal(shortRoute))));
                 }
             }
 
@@ -555,16 +548,13 @@ namespace RefitControllerGenerator.CodeFixes
         /// <returns></returns>
         private static TypeSyntax GetActionResultReturnType(ITypeSymbol returnType)
         {
+            // Task<T>
             if (returnType is INamedTypeSymbol named &&
                 named.Name == "Task" &&
                 named.TypeArguments.Length == 1)
             {
-                var typeName =
-                    named.TypeArguments[0].ToDisplayString(
-                        SymbolDisplayFormat.MinimallyQualifiedFormat);
-
                 return SyntaxFactory.ParseTypeName(
-                    $"Task<ActionResult<{typeName}>>");
+                    $"Task<ActionResult<{named.TypeArguments[0].ToDisplayString()}>>");
             }
 
             return SyntaxFactory.ParseTypeName("Task<IActionResult>");
