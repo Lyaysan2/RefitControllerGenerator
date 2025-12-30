@@ -89,38 +89,52 @@ namespace RefitControllerGenerator.CodeFixes
         }
 
         /// <summary>
-        /// Формирует CompilationUnitSyntax для файла контроллера: директивы using, пространство имён и объявление класса
+        /// Генерирует синтаксическое дерево CompilationUnit для контроллера API.
+        /// Включает все необходимые директивы using на основе интерфейса и базовые директивы для контроллера.
         /// </summary>
-        /// <param name="controllerName"></param>
-        /// <param name="interfaceName"></param>
-        /// <param name="interfaceNamespace"></param>
-        /// <param name="interfaceSymbol"></param>
-        /// <param name="controllerNamespace"></param>
-        /// <returns></returns>
+        /// <param name="controllerName">Имя генерируемого контроллера</param>
+        /// <param name="interfaceName">Имя интерфейса сервиса</param>
+        /// <param name="interfaceNamespace">Пространство имен интерфейса</param>
+        /// <param name="interfaceSymbol">Символ интерфейса для анализа типов</param>
+        /// <param name="controllerNamespace">Пространство имен контроллера</param>
+        /// <returns>Синтаксическое дерево CompilationUnit с контроллером</returns>
         private static CompilationUnitSyntax GenerateControllerSyntax(
-            string controllerName,
-            string interfaceName,
-            string interfaceNamespace,
-            INamedTypeSymbol interfaceSymbol,
-            string controllerNamespace)
+    string controllerName,
+    string interfaceName,
+    string interfaceNamespace,
+    INamedTypeSymbol interfaceSymbol,
+    string controllerNamespace)
         {
-            var authorizeUsing =
-                SyntaxFactory.UsingDirective(
+            // Собираем все уникальные юзинги из интерфейса
+            var interfaceUsings = ExtractUsingsFromInterface(interfaceSymbol);
+
+            // Базовые юзинги контроллера
+            var controllerUsings = new List<UsingDirectiveSyntax>
+    {
+        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
+        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Authorization")),
+        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Net")),
+        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities")),
+        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Refit")),
+        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("WebAPI.Services.Logger"))
+    };
+
+            // Добавляем AuthorizeAttribute с алиасом
+            var authorizeUsing = SyntaxFactory.UsingDirective(
                     SyntaxFactory.ParseName("Microsoft.AspNetCore.Authorization.AuthorizeAttribute"))
                 .WithAlias(
                     SyntaxFactory.NameEquals(
                         SyntaxFactory.IdentifierName("AuthorizeAttribute")));
 
+            // Создаем финальный список юзингов
+            var allUsings = new List<UsingDirectiveSyntax>();
+            allUsings.AddRange(controllerUsings);
+            allUsings.Add(authorizeUsing);
+            allUsings.AddRange(interfaceUsings);
+
+            // Создаем compilation unit со всеми юзингами
             return SyntaxFactory.CompilationUnit()
-                .AddUsings(
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Authorization")),
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Net")),
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities")),
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Refit")),
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("WebAPI.Services.Logger")),
-                    authorizeUsing,
-                    SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(interfaceNamespace)))
+                .AddUsings(allUsings.ToArray())
                 .AddMembers(
                     SyntaxFactory.NamespaceDeclaration(
                         SyntaxFactory.ParseName(controllerNamespace))
@@ -130,7 +144,126 @@ namespace RefitControllerGenerator.CodeFixes
         }
 
         /// <summary>
-        /// Извлекает базовый маршрут контроллера на основании маршрута первого метода интерфейса Refit
+        /// Извлекает все директивы using из интерфейса, которые необходимы для работы контроллера.
+        /// Анализирует все типы, используемые в методах и свойствах интерфейса.
+        /// </summary>
+        /// <param name="interfaceSymbol">Символ интерфейса для анализа</param>
+        /// <returns>Список директив UsingDirectiveSyntax для пространств имен, используемых в интерфейсе</returns>
+        private static List<UsingDirectiveSyntax> ExtractUsingsFromInterface(INamedTypeSymbol interfaceSymbol)
+        {
+            var usings = new HashSet<string>(StringComparer.Ordinal);
+
+            // Собираем все типы, которые используются в интерфейсе
+            CollectTypesFromSymbol(interfaceSymbol, usings);
+
+            // Преобразуем в UsingDirectiveSyntax, удаляя дубликаты и системные пространства имен
+            return usings
+                .Where(ns => !string.IsNullOrWhiteSpace(ns))
+                .Where(ns => !ns.StartsWith("System.") &&
+                             !ns.StartsWith("Microsoft.") &&
+                             !ns.StartsWith("Chulpan.Refit.WebApi.Common.Entities") &&
+                             !ns.StartsWith("Refit") &&
+                             !ns.StartsWith("WebAPI.Services.Logger"))
+                .Select(ns => SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(ns)))
+                .ToList();
+        }
+        /// <summary>
+        /// Рекурсивно собирает все пространства имен типов из символа интерфейса.
+        /// Обрабатывает методы, свойства, параметры и базовые интерфейсы.
+        /// </summary>
+        /// <param name="symbol">Символ типа (интерфейс) для анализа</param>
+        /// <param name="usings">Коллекция для накопления уникальных пространств имен</param>
+        private static void CollectTypesFromSymbol(INamedTypeSymbol symbol, HashSet<string> usings)
+        {
+            if (symbol == null) return;
+
+            // Добавляем пространство имен самого интерфейса (но не добавляем его в using)
+            var interfaceNamespace = symbol.ContainingNamespace?.ToDisplayString();
+
+            // Собираем типы из методов
+            foreach (var member in symbol.GetMembers().OfType<IMethodSymbol>())
+            {
+                // Тип возвращаемого значения
+                AddTypeNamespace(member.ReturnType, usings);
+
+                // Типы параметров
+                foreach (var parameter in member.Parameters)
+                {
+                    AddTypeNamespace(parameter.Type, usings);
+                }
+
+                // Типы generic параметров
+                foreach (var typeParam in member.TypeParameters)
+                {
+                    foreach (var constraint in typeParam.ConstraintTypes)
+                    {
+                        AddTypeNamespace(constraint, usings);
+                    }
+                }
+            }
+
+            // Собираем типы из свойств
+            foreach (var property in symbol.GetMembers().OfType<IPropertySymbol>())
+            {
+                AddTypeNamespace(property.Type, usings);
+            }
+
+            // Рекурсивно обрабатываем базовые интерфейсы
+            foreach (var baseInterface in symbol.AllInterfaces)
+            {
+                CollectTypesFromSymbol(baseInterface, usings);
+            }
+        }
+
+        /// <summary>
+        /// Добавляет пространство имен типа в коллекцию, если оно не является системным.
+        /// Рекурсивно обрабатывает массивы и generic типы.
+        /// </summary>
+        /// <param name="typeSymbol">Символ типа для анализа</param>
+        /// <param name="usings">Коллекция для добавления пространства имен</param>
+        private static void AddTypeNamespace(ITypeSymbol typeSymbol, HashSet<string> usings)
+        {
+            if (typeSymbol == null) return;
+
+            // Обрабатываем массивные типы
+            if (typeSymbol is IArrayTypeSymbol arrayType)
+            {
+                AddTypeNamespace(arrayType.ElementType, usings);
+                return;
+            }
+
+            // Обрабатываем generic типы
+            if (typeSymbol is INamedTypeSymbol namedType)
+            {
+                // Добавляем namespace основного типа
+                var ns = namedType.ContainingNamespace?.ToDisplayString();
+                if (!string.IsNullOrWhiteSpace(ns) &&
+                    !ns.StartsWith("System") &&
+                    !ns.StartsWith("Microsoft"))
+                {
+                    usings.Add(ns);
+                }
+
+                // Рекурсивно обрабатываем generic аргументы
+                foreach (var typeArg in namedType.TypeArguments)
+                {
+                    AddTypeNamespace(typeArg, usings);
+                }
+                return;
+            }
+
+            // Добавляем namespace простых типов
+            var namespaceStr = typeSymbol.ContainingNamespace?.ToDisplayString();
+            if (!string.IsNullOrWhiteSpace(namespaceStr) &&
+                !namespaceStr.StartsWith("System") &&
+                !namespaceStr.StartsWith("Microsoft"))
+            {
+                usings.Add(namespaceStr);
+            }
+        }
+
+        /// <summary>
+        /// Извлекает базовый маршрут контроллера как самый длинный неповторяющийся маршрут из интерфейса Refit
         /// </summary>
         /// <param name="interfaceSymbol"></param>
         /// <returns></returns>
@@ -146,23 +279,28 @@ namespace RefitControllerGenerator.CodeFixes
                 .Where(r => !string.IsNullOrWhiteSpace(r))
                 .Select(r => r!.Trim('/'))
                 .ToList();
+            return FindLongestCommonPrefix(routes);
+        }
 
-            if (!routes.Any())
-                return null;
+        private static string? FindLongestCommonPrefix(List<string> strs)
+        {
+            if (strs == null || strs.Count == 0) return null;
 
-            var split = routes
-                .Select(r => r.Split('/'))
-                .ToList();
+            string first = strs.First();
 
-            var commonSegments = split
-                .First()
-                .TakeWhile((segment, index) =>
-                    split.All(s => s.Length > index && s[index] == segment))
-                .ToArray();
+            for (int i = 0; i < first.Length; i++)
+            {
+                char currentChar = first[i];
 
-            return commonSegments.Length == 0
-                ? null
-                : string.Join("/", commonSegments);
+                foreach (var str in strs)
+                {
+                    if (i >= str.Length || str[i] != currentChar)
+                    {
+                        return first.Substring(0, i);
+                    }
+                }
+            }
+            return first;
         }
 
         /// <summary>
@@ -212,7 +350,7 @@ namespace RefitControllerGenerator.CodeFixes
                     SyntaxFactory.AttributeList(
                             SyntaxFactory.SingletonSeparatedList(
                                 SyntaxFactory.Attribute(
-                                    SyntaxFactory.IdentifierName("Authorize")))))
+                                    SyntaxFactory.IdentifierName("Authorize(Roles = $\"{UserRoles.Agent},{UserRoles.Manager},{UserRoles.Admin}\")")))))
                 .AddMembers(
                     GenerateServiceField(interfaceName),
                     GenerateLoggerField(),
@@ -223,8 +361,9 @@ namespace RefitControllerGenerator.CodeFixes
 
             var docsTrivia = GenerateControllerDocs(interfaceSymbol);
             if (docsTrivia.Count > 0)
-                classDecl = classDecl.WithLeadingTrivia(
-                    docsTrivia);
+            {
+                classDecl = classDecl.WithLeadingTrivia(docsTrivia);
+            }
 
             return classDecl;
         }
@@ -270,13 +409,7 @@ namespace RefitControllerGenerator.CodeFixes
                         GenerateHttpAttribute(httpMethod, route, baseRoute))
                     .AddAttributeLists(
                         GenerateProducesAttributes())
-                    .AddAttributeLists(
-                        SyntaxFactory.AttributeList(
-                            SyntaxFactory.SingletonSeparatedList(
-                                SyntaxFactory.Attribute(
-                                    SyntaxFactory.IdentifierName("Authorize"))))
-                    )
-                    .WithBody(GenerateMethodBody(method));
+                    .WithBody(GenerateMethodBody(httpMethod, method));
 
             var docsTrivia = GenerateMethodDocs(method);
             if (docsTrivia.Count > 0)
@@ -395,7 +528,7 @@ namespace RefitControllerGenerator.CodeFixes
 
             var lines = xml
                 .Split('\n')
-                .Select(l => l.Trim()) 
+                .Select(l => l.Trim())
                 .Where(l => !string.IsNullOrEmpty(l))
                 .Select(l => "/// " + l);
 
@@ -577,7 +710,7 @@ namespace RefitControllerGenerator.CodeFixes
         /// </summary>
         /// <param name="method"></param>
         /// <returns></returns>
-        private static BlockSyntax GenerateMethodBody(IMethodSymbol method)
+        private static BlockSyntax GenerateMethodBody(string? httpMethod, IMethodSymbol method)
         {
             var serviceFieldName = GetServiceFieldName(method.ContainingType.Name);
 
@@ -586,11 +719,28 @@ namespace RefitControllerGenerator.CodeFixes
             var serviceCall = SyntaxFactory.ParseStatement(
                 $"var result = await {serviceFieldName}.{method.Name}({callArgs});");
 
+            // Определяем логику возврата результата в зависимости от HTTP метода
+            StatementSyntax returnStatement = SyntaxFactory.IfStatement(
+                    SyntaxFactory.ParseExpression("result != null"),
+                    SyntaxFactory.Block(
+                        SyntaxFactory.ParseStatement("return Ok(result);")
+                    ),
+                    SyntaxFactory.ElseClause(
+                        SyntaxFactory.Block(
+                            SyntaxFactory.ParseStatement(
+                                    // Для GET методов: если результат не null - Ok, иначе - NotFound
+                                    // Для других HTTP методов: если результат не null - Ok, иначе - BadRequest
+                                    httpMethod != null && httpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase)
+                                ? "return NotFound();" : "return BadRequest();")
+                        )
+                    )
+                );
+
             var tryBody = SyntaxFactory.Block(
                 SyntaxFactory.ParseStatement(
                     $"logger.Debug(\"Вызов метода {method.Name}\");"),
                 serviceCall,
-                SyntaxFactory.ParseStatement("return Ok(result);")
+                returnStatement
             );
 
             return SyntaxFactory.Block(
@@ -604,10 +754,10 @@ namespace RefitControllerGenerator.CodeFixes
                                 "return Unauthorized(e);"),
                             GenerateCatch(
                                 "ArgumentException",
-                                "return BadRequestApiResult(e.Message);"),
+                                "return BadRequest(new ApiResult((int)HttpStatusCode.BadRequest, e.Message, e.Message));"),
                             GenerateCatch(
                                 "Exception",
-                                "return InternalServerErrorApiResult(new ApiResult((int)HttpStatusCode.InternalServerError, e.Message, e.Message));")
+                                "return StatusCode((int)HttpStatusCode.InternalServerError, new ApiResult((int)HttpStatusCode.InternalServerError, e.Message, e.Message));")
                         }))
             );
         }
