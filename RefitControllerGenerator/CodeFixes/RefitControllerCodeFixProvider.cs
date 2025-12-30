@@ -676,6 +676,55 @@ namespace RefitControllerGenerator.CodeFixes
             return SyntaxFactory.ParseTypeName("Task<IActionResult>");
         }
 
+        private enum ResultKind
+        {
+            None,
+            SingleObject,
+            Collection
+        }
+
+        private static (ResultKind Kind, string? TypeName) AnalyzeResultType(IMethodSymbol method)
+        {
+            ITypeSymbol? type = method.ReturnType;
+
+            // Task<T>
+            if (type is INamedTypeSymbol taskType &&
+                taskType.Name == "Task" &&
+                taskType.TypeArguments.Length == 1)
+            {
+                type = taskType.TypeArguments[0];
+            }
+
+            // ActionResult<T>
+            if (type is INamedTypeSymbol actionResultType &&
+                actionResultType.Name == "ActionResult" &&
+                actionResultType.TypeArguments.Length == 1)
+            {
+                type = actionResultType.TypeArguments[0];
+            }
+
+            if (type == null)
+                return (ResultKind.None, null);
+
+            // Коллекция
+            if (type is INamedTypeSymbol namedType &&
+                namedType.AllInterfaces.Any(i =>
+                    i.Name == "IEnumerable" &&
+                    i.TypeArguments.Length == 1))
+            {
+                return (ResultKind.Collection, null);
+            }
+
+            // Примитив / string
+            if (IsPrimitiveOrSimpleType(type))
+                return (ResultKind.None, null);
+
+            // Одиночный объект
+            return (ResultKind.SingleObject, type.Name);
+        }
+
+
+
         /// <summary>
         /// Формирует тело метода контроллера: логирование, вызов сервиса, try/catch, возврат результата
         /// </summary>
@@ -690,35 +739,31 @@ namespace RefitControllerGenerator.CodeFixes
             var serviceCall = SyntaxFactory.ParseStatement(
                 $"var result = await {serviceFieldName}.{method.Name}({callArgs});");
 
-            // Получаем имя типа первого параметра для логирования
-            string? parameterTypeName = null;
-            if (method.Parameters.Length > 0)
-            {
-                // Берем имя типа первого параметра
-                var firstParam = method.Parameters[0];
-                var parameterType = firstParam.Type;
-
-                // Проверяем, является ли тип примитивным или строкой
-                if (!IsPrimitiveOrSimpleType(parameterType))
-                {
-                    // Это объект - берем его имя для логирования
-                    parameterTypeName = parameterType.Name;
-                }
-            }
+            // Получаем имя возвращаемого типа для логирования
+            var resultInfo = AnalyzeResultType(method);
 
             // Определяем логику возврата результата в зависимости от HTTP метода
             StatementSyntax returnStatement = SyntaxFactory.IfStatement(
                     SyntaxFactory.ParseExpression("result != null"),
                     SyntaxFactory.Block(
-                           SyntaxFactory.ParseStatement(
-                               parameterTypeName != null 
-                               ? $"logger.Debug(\"Успешно. {{@{parameterTypeName}}}\", result);" : $"logger.Debug(\"Успешно\");"),
+                        SyntaxFactory.ParseStatement(
+                            resultInfo.Kind switch
+                            {
+                                ResultKind.SingleObject =>
+                                    $"logger.Debug(\"Успешно. {{@{resultInfo.TypeName}}}\", result);",
+                                ResultKind.Collection =>
+                                    "logger.Debug(\"Успешно. {Count} объектов\", result?.Count);",
+                                _ =>
+                                    "logger.Debug(\"Успешно\");"
+                            })
+                           .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
                            SyntaxFactory.ParseStatement("return Ok(result);")
                     ),
                     SyntaxFactory.ElseClause(
                         SyntaxFactory.Block(
                             SyntaxFactory.ParseStatement(
-                                $"logger.Error(\"Объект не найден\");"),
+                                $"logger.Error(\"Объект не найден\");")
+                            .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
                             SyntaxFactory.ParseStatement(
                                 // Для GET методов: если результат не null - Ok, иначе - NotFound
                                 // Для других HTTP методов: если результат не null - Ok, иначе - BadRequest
@@ -730,7 +775,7 @@ namespace RefitControllerGenerator.CodeFixes
 
             var tryBody = SyntaxFactory.Block(
                 SyntaxFactory.ParseStatement(
-                    $"logger.Debug(\"Вызов метода {method.Name}\");"),
+                    $"logger.Debug(\"Вызов метода {method.Name}\");").WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
                 serviceCall,
                 returnStatement
             );
@@ -819,7 +864,8 @@ namespace RefitControllerGenerator.CodeFixes
                 .WithBlock(
                     SyntaxFactory.Block(
                         SyntaxFactory.ParseStatement(
-                            $"logger.Error($\"{{e.Message}} {{e}}\");"),
+                            $"logger.Error($\"{{e.Message}} {{e}}\");")
+                        .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
                         SyntaxFactory.ParseStatement(returnStatement)));
         }
 
