@@ -60,9 +60,7 @@ namespace RefitControllerGenerator.CodeFixes
         /// <param name="interfaceSymbol"></param>
         /// <param name="cancellationToken"></param>
         /// <returns></returns>
-        private static async Task<Solution> GenerateControllerAsync(
-            Document document,
-            INamedTypeSymbol interfaceSymbol,
+        private static async Task<Solution> GenerateControllerAsync(Document document, INamedTypeSymbol interfaceSymbol, 
             CancellationToken cancellationToken)
         {
             var controllerName = GetControllerName(interfaceSymbol.Name);
@@ -98,26 +96,21 @@ namespace RefitControllerGenerator.CodeFixes
         /// <param name="interfaceSymbol">Символ интерфейса для анализа типов</param>
         /// <param name="controllerNamespace">Пространство имен контроллера</param>
         /// <returns>Синтаксическое дерево CompilationUnit с контроллером</returns>
-        private static CompilationUnitSyntax GenerateControllerSyntax(
-    string controllerName,
-    string interfaceName,
-    string interfaceNamespace,
-    INamedTypeSymbol interfaceSymbol,
-    string controllerNamespace)
+        private static CompilationUnitSyntax GenerateControllerSyntax(string controllerName, string interfaceName, string interfaceNamespace,
+            INamedTypeSymbol interfaceSymbol, string controllerNamespace)
         {
             // Собираем все уникальные юзинги из интерфейса
             var interfaceUsings = ExtractUsingsFromInterface(interfaceSymbol);
 
             // Базовые юзинги контроллера
             var controllerUsings = new List<UsingDirectiveSyntax>
-    {
-        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
-        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Authorization")),
-        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Net")),
-        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities")),
-        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Refit")),
-        SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("WebAPI.Services.Logger"))
-    };
+            {
+                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
+                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Net")),
+                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities")),
+                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Refit")),
+                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("WebAPI.Services.Logger"))
+            };
 
             // Добавляем AuthorizeAttribute с алиасом
             var authorizeUsing = SyntaxFactory.UsingDirective(
@@ -537,7 +530,6 @@ namespace RefitControllerGenerator.CodeFixes
             return SyntaxFactory.ParseLeadingTrivia(text + "\r\n");
         }
 
-
         /// <summary>
         /// Формирует один атрибут ProducesResponseType с кодом статуса и при необходимости с типом результата
         /// </summary>
@@ -719,18 +711,39 @@ namespace RefitControllerGenerator.CodeFixes
             var serviceCall = SyntaxFactory.ParseStatement(
                 $"var result = await {serviceFieldName}.{method.Name}({callArgs});");
 
+            // Получаем имя типа первого параметра для логирования
+            string? parameterTypeName = null;
+            if (method.Parameters.Length > 0)
+            {
+                // Берем имя типа первого параметра
+                var firstParam = method.Parameters[0];
+                var parameterType = firstParam.Type;
+
+                // Проверяем, является ли тип примитивным или строкой
+                if (!IsPrimitiveOrSimpleType(parameterType))
+                {
+                    // Это объект - берем его имя для логирования
+                    parameterTypeName = parameterType.Name;
+                }
+            }
+
             // Определяем логику возврата результата в зависимости от HTTP метода
             StatementSyntax returnStatement = SyntaxFactory.IfStatement(
                     SyntaxFactory.ParseExpression("result != null"),
                     SyntaxFactory.Block(
-                        SyntaxFactory.ParseStatement("return Ok(result);")
+                           SyntaxFactory.ParseStatement(
+                               parameterTypeName != null 
+                               ? $"logger.Debug(\"Успешно. {{@{parameterTypeName}}}\", result);" : $"logger.Debug(\"Успешно\");"),
+                           SyntaxFactory.ParseStatement("return Ok(result);")
                     ),
                     SyntaxFactory.ElseClause(
                         SyntaxFactory.Block(
                             SyntaxFactory.ParseStatement(
-                                    // Для GET методов: если результат не null - Ok, иначе - NotFound
-                                    // Для других HTTP методов: если результат не null - Ok, иначе - BadRequest
-                                    httpMethod != null && httpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase)
+                                $"logger.Error(\"Объект не найден\");"),
+                            SyntaxFactory.ParseStatement(
+                                // Для GET методов: если результат не null - Ok, иначе - NotFound
+                                // Для других HTTP методов: если результат не null - Ok, иначе - BadRequest
+                                httpMethod != null && httpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase)
                                 ? "return NotFound();" : "return BadRequest();")
                         )
                     )
@@ -760,6 +773,55 @@ namespace RefitControllerGenerator.CodeFixes
                                 "return StatusCode((int)HttpStatusCode.InternalServerError, new ApiResult((int)HttpStatusCode.InternalServerError, e.Message, e.Message));")
                         }))
             );
+        }
+
+        private static bool IsPrimitiveOrSimpleType(ITypeSymbol type)
+        {
+            // Получаем специальные типы
+            var specialType = type.SpecialType;
+
+            // Проверяем, является ли тип примитивным (встроенным)
+            switch (specialType)
+            {
+                case SpecialType.System_Object:
+                case SpecialType.System_Void:
+                case SpecialType.System_Boolean:
+                case SpecialType.System_Char:
+                case SpecialType.System_SByte:
+                case SpecialType.System_Byte:
+                case SpecialType.System_Int16:
+                case SpecialType.System_UInt16:
+                case SpecialType.System_Int32:
+                case SpecialType.System_UInt32:
+                case SpecialType.System_Int64:
+                case SpecialType.System_UInt64:
+                case SpecialType.System_Decimal:
+                case SpecialType.System_Single:
+                case SpecialType.System_Double:
+                case SpecialType.System_String:
+                case SpecialType.System_DateTime:
+                case SpecialType.System_IntPtr:
+                case SpecialType.System_UIntPtr:
+                    return true;
+            }
+
+            // Проверяем, является ли тип Guid (часто используется как простой тип)
+            if (type.ToDisplayString() == "System.Guid")
+                return true;
+
+            // Проверяем, является ли тип enum
+            if (type.TypeKind == TypeKind.Enum)
+                return true;
+
+            // Проверяем, является ли тип nullable и его underlying type - примитив
+            if (type is INamedTypeSymbol namedType &&
+                namedType.IsGenericType &&
+                namedType.ConstructedFrom.SpecialType == SpecialType.System_Nullable_T)
+            {
+                return IsPrimitiveOrSimpleType(namedType.TypeArguments[0]);
+            }
+
+            return false;
         }
 
         /// <summary>
