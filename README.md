@@ -26,3 +26,7 @@ dotnet add package RefitControllerGenerator --source //путь до папки 
 Выбрать ``Generate controller 'ControllerName'``. 
 
 Контроллер генерируется в папку ``$"{document.Project.Name}.Controllers"``.
+
+## Можно проще
+
+Сборка Nuget-пакета версии 1.0.0 находится в папке RefitControllerGenerator/nupkg
