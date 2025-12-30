@@ -4,6 +4,7 @@ using Microsoft.CodeAnalysis.CodeActions;
 using Microsoft.CodeAnalysis.CodeFixes;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Formatting;
 using System;
 using System.Collections.Generic;
 using System.Collections.Immutable;
@@ -73,10 +74,9 @@ namespace RefitControllerGenerator.CodeFixes
                 interfaceSymbol,
                 controllerNamespace);
 
-            var formatted = Microsoft.CodeAnalysis.Formatting.Formatter.Format(
-                controllerSyntax,
-                document.Project.Solution.Workspace,
-                cancellationToken: cancellationToken);
+            var workspace = new AdhocWorkspace();
+            var formattedNode = (CompilationUnitSyntax)Formatter.Format(controllerSyntax, workspace);
+            var formatted = formattedNode;
 
             var newDoc = document.Project.AddDocument(
                 $"{controllerName}.cs",
@@ -108,7 +108,6 @@ namespace RefitControllerGenerator.CodeFixes
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Net")),
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities")),
-                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Refit")),
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("WebAPI.Services.Logger"))
             };
 
@@ -132,8 +131,7 @@ namespace RefitControllerGenerator.CodeFixes
                     SyntaxFactory.NamespaceDeclaration(
                         SyntaxFactory.ParseName(controllerNamespace))
                     .AddMembers(
-                        GenerateControllerClass(controllerName, interfaceName, interfaceSymbol)))
-                .NormalizeWhitespace();
+                        GenerateControllerClass(controllerName, interfaceName, interfaceSymbol)));
         }
 
         /// <summary>
@@ -160,6 +158,7 @@ namespace RefitControllerGenerator.CodeFixes
                 .Select(ns => SyntaxFactory.UsingDirective(SyntaxFactory.ParseName(ns)))
                 .ToList();
         }
+
         /// <summary>
         /// Рекурсивно собирает все пространства имен типов из символа интерфейса.
         /// Обрабатывает методы, свойства, параметры и базовые интерфейсы.
@@ -296,6 +295,12 @@ namespace RefitControllerGenerator.CodeFixes
             return first;
         }
 
+        private static SyntaxTriviaList ElasticBlankLine()
+        {
+            return SyntaxFactory.TriviaList(
+                SyntaxFactory.ElasticCarriageReturnLineFeed);
+        }
+
         /// <summary>
         /// Создаёт декларацию класса контроллера, добавляет атрибуты, DI-поля, конструктор, XML-комментарии и сгенерированные методы
         /// </summary>
@@ -308,12 +313,15 @@ namespace RefitControllerGenerator.CodeFixes
             var serviceFieldName = GetServiceFieldName(interfaceName);
 
             var constructor = GenerateConstructor(controllerName, interfaceName);
+            // Добавляем комментарий к конструктору
             var constructorDocs = GenerateConstructorDocs(new[] { serviceFieldName, "logger" });
-            if (constructorDocs != null)
-                constructor = constructor.WithLeadingTrivia(
-                    SyntaxFactory.TriviaList(
-                        SyntaxFactory.Trivia(constructorDocs),
-                        SyntaxFactory.ElasticCarriageReturnLineFeed));
+            if (constructorDocs.Count > 0)
+            {
+                constructor = constructor.WithLeadingTrivia(ElasticBlankLine().AddRange(constructorDocs));
+            }
+
+            var serviceField = GenerateServiceField(interfaceName);
+            var loggerField = GenerateLoggerField();
 
             var baseRoute = TryGetBaseRoute(interfaceSymbol) ?? "api/[controller]";
 
@@ -343,13 +351,9 @@ namespace RefitControllerGenerator.CodeFixes
                     SyntaxFactory.AttributeList(
                             SyntaxFactory.SingletonSeparatedList(
                                 SyntaxFactory.Attribute(
-                                    SyntaxFactory.IdentifierName("Authorize(Roles = $\"{UserRoles.Agent},{UserRoles.Manager},{UserRoles.Admin}\")")))))
-                .AddMembers(
-                    GenerateServiceField(interfaceName),
-                    GenerateLoggerField(),
-                    constructor
-                )
-
+                                    SyntaxFactory.IdentifierName("Authorize")))))
+                .AddMembers(serviceField, loggerField)
+                .AddMembers(constructor)
                 .AddMembers(GenerateControllerMethods(interfaceSymbol, baseRoute));
 
             var docsTrivia = GenerateControllerDocs(interfaceSymbol);
@@ -424,43 +428,6 @@ namespace RefitControllerGenerator.CodeFixes
             if (string.IsNullOrWhiteSpace(xml))
                 return default;
 
-            //try
-            //{
-            //    xml = xml.Replace("<doc>", "")
-            //             .Replace("</doc>", "")
-            //             .Replace("Интерфейс", "Контроллер")
-            //             .Trim();
-
-            //    var lines = xml.Split('\n')
-            //                   .Select(l => l.Trim())
-            //                   .Where(l => !string.IsNullOrWhiteSpace(l))
-            //                   .ToArray();
-
-            //    if (lines.Length == 0)
-            //        return null;
-
-            //    var content = string.Join(Environment.NewLine, lines);
-
-            //    // Формируем полный XML комментарий с /// в начале каждой строки
-            //    var xmlLines = content.Split(new[] { Environment.NewLine }, StringSplitOptions.None);
-            //    var fullXml = string.Join(Environment.NewLine, xmlLines.Select(l => "/// " + l));
-
-            //    // Парсим как синтаксическую тривию
-            //    var trivia = SyntaxFactory.ParseLeadingTrivia(fullXml);
-
-            //    // Ищем DocumentationCommentTriviaSyntax в тривиях
-            //    var docCommentTrivia = trivia
-            //        .Select(t => t.GetStructure())
-            //        .OfType<DocumentationCommentTriviaSyntax>()
-            //        .FirstOrDefault();
-
-            //    return docCommentTrivia;
-            //}
-            //catch
-            //{
-            //    return null;
-            //}
-
             // Remove <doc> wrapper
             xml = xml.Replace("<doc>", "")
                      .Replace("</doc>", "")
@@ -485,20 +452,32 @@ namespace RefitControllerGenerator.CodeFixes
         /// </summary>
         /// <param name="parameterNames"></param>
         /// <returns></returns>
-        private static DocumentationCommentTriviaSyntax GenerateConstructorDocs(IEnumerable<string> parameterNames)
+        private static SyntaxTriviaList GenerateConstructorDocs(IEnumerable<string> parameterNames)
         {
+            var indent = "    "; // 4 пробела для отступа внутри класса
             var nl = Environment.NewLine;
-            var xml = "/// <summary>" + nl +
-                      "/// DI-конструктор" + nl +
-                      "/// </summary>" + nl;
+
+            // Строим текст комментария с правильными отступами
+            var commentLines = new List<string>
+            {
+                $"{indent}/// <summary>",
+                $"{indent}/// DI-конструктор",
+                $"{indent}/// </summary>"
+            };
 
             foreach (var name in parameterNames)
             {
-                xml += $"/// <param name=\"{name}\"></param>" + nl;
+                commentLines.Add($"{indent}/// <param name=\"{name}\"></param>");
             }
 
-            var trivia = SyntaxFactory.ParseLeadingTrivia(xml).FirstOrDefault();
-            return trivia.GetStructure() as DocumentationCommentTriviaSyntax;
+            // Добавляем пустую строку после комментария
+            commentLines.Add(indent); // Просто отступ, будет воспринят как начало следующей строки
+
+            // Объединяем все строки
+            var commentText = string.Join(nl, commentLines);
+
+            // Парсим как ведущую тривию
+            return SyntaxFactory.ParseLeadingTrivia(commentText);
         }
 
         /// <summary>
@@ -890,14 +869,19 @@ namespace RefitControllerGenerator.CodeFixes
         /// <returns></returns>
         private static FieldDeclarationSyntax GenerateLoggerField()
         {
-            return SyntaxFactory.FieldDeclaration(
+            var field = SyntaxFactory.FieldDeclaration(
                     SyntaxFactory.VariableDeclaration(
                         SyntaxFactory.ParseTypeName("ITraceableLogger"))
                     .AddVariables(
                         SyntaxFactory.VariableDeclarator("logger")))
                 .AddModifiers(
                     SyntaxFactory.Token(SyntaxKind.PrivateKeyword),
-                    SyntaxFactory.Token(SyntaxKind.ReadOnlyKeyword));
+                    SyntaxFactory.Token(SyntaxKind.ReadOnlyKeyword))
+                .WithTrailingTrivia(
+                    SyntaxFactory.TriviaList(
+                        SyntaxFactory.CarriageReturnLineFeed,
+                        SyntaxFactory.CarriageReturnLineFeed));
+            return field;
         }
 
         /// <summary>
