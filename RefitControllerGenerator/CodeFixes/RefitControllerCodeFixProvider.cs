@@ -107,8 +107,7 @@ namespace RefitControllerGenerator.CodeFixes
             {
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("System.Net")),
-                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities")),
-                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("WebAPI.Services.Logger"))
+                SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities"))
             };
 
             // Добавляем AuthorizeAttribute с алиасом
@@ -271,28 +270,38 @@ namespace RefitControllerGenerator.CodeFixes
                 .Where(r => !string.IsNullOrWhiteSpace(r))
                 .Select(r => r!.Trim('/'))
                 .ToList();
+
             return FindLongestCommonPrefix(routes);
         }
 
-        private static string? FindLongestCommonPrefix(List<string> strs)
+        private static string? FindLongestCommonPrefix(List<string> routes)
         {
-            if (strs == null || strs.Count == 0) return null;
+            if (routes == null || routes.Count == 0) return null;
 
-            string first = strs.First();
+            var segmentsList = routes
+                .Select(r => r.Split('/'))
+                .ToList();
 
-            for (int i = 0; i < first.Length; i++)
+            var firstSegments = segmentsList[0];
+            var commonSegments = new List<string>();
+
+            for (int i = 0; i < firstSegments.Length; i++)
             {
-                char currentChar = first[i];
+                var segment = firstSegments[i];
 
-                foreach (var str in strs)
-                {
-                    if (i >= str.Length || str[i] != currentChar)
-                    {
-                        return first.Substring(0, i);
-                    }
-                }
+                // Пропускаем сегменты с параметрами типа {code}
+                if (segment.StartsWith("{"))
+                    break;
+
+                // Проверяем, что все маршруты совпадают на этом сегменте
+                bool allMatch = segmentsList.All(s => i < s.Length && s[i] == segment);
+                if (!allMatch)
+                    break;
+
+                commonSegments.Add(segment);
             }
-            return first;
+
+            return commonSegments.Count > 0 ? string.Join("/", commonSegments) : null;
         }
 
         private static SyntaxTriviaList ElasticBlankLine()
@@ -960,7 +969,7 @@ namespace RefitControllerGenerator.CodeFixes
                     ? interfaceName.Substring(1)
                     : interfaceName;
 
-            if (name.EndsWith("Api", StringComparison.Ordinal))
+            if (name.EndsWith("Api", StringComparison.OrdinalIgnoreCase))
                 name = name.Substring(0, name.Length - 3);
 
             return char.ToLowerInvariant(name[0]) + name.Substring(1) + "Service";
@@ -977,7 +986,7 @@ namespace RefitControllerGenerator.CodeFixes
                 ? interfaceName.Substring(1)
                 : interfaceName;
 
-            if (name.EndsWith("Api", StringComparison.Ordinal))
+            if (name.EndsWith("Api", StringComparison.OrdinalIgnoreCase))
                 name = name.Substring(0, name.Length - 3);
 
             return name + "Controller";
