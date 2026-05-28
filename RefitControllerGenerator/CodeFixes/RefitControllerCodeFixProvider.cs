@@ -24,10 +24,10 @@ namespace RefitControllerGenerator.CodeFixes
             => WellKnownFixAllProviders.BatchFixer;
 
         /// <summary>
-        /// Регистрирует действие CodeFix для диагностического предупреждения и инициализирует генерацию контроллера на основании Refit-интерфейса
+        /// Регистрирует действие CodeFix для диагностического предупреждения.
+        /// Если контроллер уже существует — предлагает добавить только новые методы.
+        /// Если контроллера нет — предлагает сгенерировать его целиком.
         /// </summary>
-        /// <param name="context"></param>
-        /// <returns></returns>
         public override async Task RegisterCodeFixesAsync(CodeFixContext context)
         {
             var diagnostic = context.Diagnostics.First();
@@ -46,22 +46,138 @@ namespace RefitControllerGenerator.CodeFixes
             if (typeSymbol == null)
                 return;
 
-            context.RegisterCodeFix(
-                CodeAction.Create(
-                    "Generate controller from Refit interface",
-                    ct => GenerateControllerAsync(context.Document, typeSymbol, ct),
-                    nameof(RefitControllerCodeFixProvider)),
-                diagnostic);
+            // Check whether a controller file already exists in the project
+            var controllerName = GetControllerName(typeSymbol.Name);
+            var existingControllerDoc = FindExistingControllerDocument(context.Document.Project, controllerName);
+
+            if (existingControllerDoc != null)
+            {
+                // Controller exists — offer to add only new methods
+                context.RegisterCodeFix(
+                    CodeAction.Create(
+                        $"Add new methods to existing {controllerName}",
+                        ct => AddNewMethodsToControllerAsync(context.Document, existingControllerDoc, typeSymbol, ct),
+                        nameof(RefitControllerCodeFixProvider) + ".AddMethods"),
+                    diagnostic);
+            }
+            else
+            {
+                // Controller does not exist — offer full generation
+                context.RegisterCodeFix(
+                    CodeAction.Create(
+                        "Generate controller from Refit interface",
+                        ct => GenerateControllerAsync(context.Document, typeSymbol, ct),
+                        nameof(RefitControllerCodeFixProvider)),
+                    diagnostic);
+            }
         }
+
+        // -------------------------------------------------------------------------
+        // Lookup helpers
+        // -------------------------------------------------------------------------
+
+        /// <summary>
+        /// Ищет уже существующий документ контроллера в проекте по имени файла.
+        /// </summary>
+        private static Document? FindExistingControllerDocument(Project project, string controllerName)
+        {
+            var fileName = $"{controllerName}.cs";
+            return project.Documents.FirstOrDefault(d =>
+                string.Equals(d.Name, fileName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        /// <summary>
+        /// Возвращает множество имён методов, уже объявленных в контроллере.
+        /// </summary>
+        private static async Task<HashSet<string>> GetExistingMethodNamesAsync(
+            Document controllerDoc, CancellationToken cancellationToken)
+        {
+            var root = await controllerDoc.GetSyntaxRootAsync(cancellationToken);
+            if (root == null)
+                return new HashSet<string>(StringComparer.Ordinal);
+
+            var methods = root
+                .DescendantNodes()
+                .OfType<MethodDeclarationSyntax>()
+                .Select(m => m.Identifier.ValueText);
+
+            return new HashSet<string>(methods, StringComparer.Ordinal);
+        }
+
+        // -------------------------------------------------------------------------
+        // Code action: add new methods to an existing controller
+        // -------------------------------------------------------------------------
+
+        /// <summary>
+        /// Находит в интерфейсе методы, которых ещё нет в контроллере, генерирует их
+        /// и вставляет в конец объявления класса контроллера.
+        /// </summary>
+        private static async Task<Solution> AddNewMethodsToControllerAsync(
+            Document sourceDocument,
+            Document controllerDocument,
+            INamedTypeSymbol interfaceSymbol,
+            CancellationToken cancellationToken)
+        {
+            // 1. Determine which methods are missing
+            var existingNames = await GetExistingMethodNamesAsync(controllerDocument, cancellationToken);
+
+            var newMethods = interfaceSymbol
+                .GetMembers()
+                .OfType<IMethodSymbol>()
+                .Where(m => m.MethodKind == MethodKind.Ordinary)
+                .Where(m => !existingNames.Contains(m.Name))
+                .ToList();
+
+            if (newMethods.Count == 0)
+                return controllerDocument.Project.Solution; // nothing to add
+
+            // 2. Parse the existing controller file
+            var root = await controllerDocument.GetSyntaxRootAsync(cancellationToken)
+                       as CompilationUnitSyntax;
+            if (root == null)
+                return controllerDocument.Project.Solution;
+
+            // 3. Find the class declaration
+            var classDecl = root.DescendantNodes()
+                .OfType<ClassDeclarationSyntax>()
+                .FirstOrDefault();
+
+            if (classDecl == null)
+                return controllerDocument.Project.Solution;
+
+            // 4. Derive the base route the same way as during initial generation
+            var baseRoute = TryGetBaseRoute(interfaceSymbol) ?? "api/[controller]";
+
+            // 5. Build the new method declarations
+            var generatedMembers = newMethods
+                .Select(m => GenerateControllerMethod(m, baseRoute))
+                .ToArray<MemberDeclarationSyntax>();
+
+            // 6. Insert generated members at the end of the class
+            var updatedClass = classDecl.AddMembers(generatedMembers);
+
+            // 7. Replace the class in the tree and format
+            var updatedRoot = root.ReplaceNode(classDecl, updatedClass);
+
+            var workspace = new AdhocWorkspace();
+            var formattedRoot = Formatter.Format(updatedRoot, workspace, cancellationToken: cancellationToken)
+                                as CompilationUnitSyntax ?? updatedRoot;
+
+            // 8. Update the document and return the new solution
+            var updatedDoc = controllerDocument.WithSyntaxRoot(formattedRoot);
+            return updatedDoc.Project.Solution;
+        }
+
+        // -------------------------------------------------------------------------
+        // Code action: generate a brand-new controller file
+        // -------------------------------------------------------------------------
 
         /// <summary>
         /// Создаёт новый файл контроллера, формирует синтаксическое дерево, форматирует его и добавляет документ в проект
         /// </summary>
-        /// <param name="document"></param>
-        /// <param name="interfaceSymbol"></param>
-        /// <param name="cancellationToken"></param>
-        /// <returns></returns>
-        private static async Task<Solution> GenerateControllerAsync(Document document, INamedTypeSymbol interfaceSymbol, 
+        private static async Task<Solution> GenerateControllerAsync(
+            Document document,
+            INamedTypeSymbol interfaceSymbol,
             CancellationToken cancellationToken)
         {
             var controllerName = GetControllerName(interfaceSymbol.Name);
@@ -76,33 +192,31 @@ namespace RefitControllerGenerator.CodeFixes
 
             var workspace = new AdhocWorkspace();
             var formattedNode = (CompilationUnitSyntax)Formatter.Format(controllerSyntax, workspace);
-            var formatted = formattedNode;
 
             var newDoc = document.Project.AddDocument(
                 $"{controllerName}.cs",
-                formatted.GetText(),
+                formattedNode.GetText(),
                 folders: new[] { "Controllers" });
 
             return newDoc.Project.Solution;
         }
 
+        // -------------------------------------------------------------------------
+        // Syntax generation — controller file
+        // -------------------------------------------------------------------------
+
         /// <summary>
         /// Генерирует синтаксическое дерево CompilationUnit для контроллера API.
-        /// Включает все необходимые директивы using на основе интерфейса и базовые директивы для контроллера.
         /// </summary>
-        /// <param name="controllerName">Имя генерируемого контроллера</param>
-        /// <param name="interfaceName">Имя интерфейса сервиса</param>
-        /// <param name="interfaceNamespace">Пространство имен интерфейса</param>
-        /// <param name="interfaceSymbol">Символ интерфейса для анализа типов</param>
-        /// <param name="controllerNamespace">Пространство имен контроллера</param>
-        /// <returns>Синтаксическое дерево CompilationUnit с контроллером</returns>
-        private static CompilationUnitSyntax GenerateControllerSyntax(string controllerName, string interfaceName, string interfaceNamespace,
-            INamedTypeSymbol interfaceSymbol, string controllerNamespace)
+        private static CompilationUnitSyntax GenerateControllerSyntax(
+            string controllerName,
+            string interfaceName,
+            string interfaceNamespace,
+            INamedTypeSymbol interfaceSymbol,
+            string controllerNamespace)
         {
-            // Собираем все уникальные юзинги из интерфейса
             var interfaceUsings = ExtractUsingsFromInterface(interfaceSymbol);
 
-            // Базовые юзинги контроллера
             var controllerUsings = new List<UsingDirectiveSyntax>
             {
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Microsoft.AspNetCore.Mvc")),
@@ -110,20 +224,17 @@ namespace RefitControllerGenerator.CodeFixes
                 SyntaxFactory.UsingDirective(SyntaxFactory.ParseName("Chulpan.Refit.WebApi.Common.Entities"))
             };
 
-            // Добавляем AuthorizeAttribute с алиасом
             var authorizeUsing = SyntaxFactory.UsingDirective(
                     SyntaxFactory.ParseName("Microsoft.AspNetCore.Authorization.AuthorizeAttribute"))
                 .WithAlias(
                     SyntaxFactory.NameEquals(
                         SyntaxFactory.IdentifierName("AuthorizeAttribute")));
 
-            // Создаем финальный список юзингов
             var allUsings = new List<UsingDirectiveSyntax>();
             allUsings.AddRange(controllerUsings);
             allUsings.Add(authorizeUsing);
             allUsings.AddRange(interfaceUsings);
 
-            // Создаем compilation unit со всеми юзингами
             return SyntaxFactory.CompilationUnit()
                 .AddUsings(allUsings.ToArray())
                 .AddMembers(
@@ -133,20 +244,15 @@ namespace RefitControllerGenerator.CodeFixes
                         GenerateControllerClass(controllerName, interfaceName, interfaceSymbol)));
         }
 
-        /// <summary>
-        /// Извлекает все директивы using из интерфейса, которые необходимы для работы контроллера.
-        /// Анализирует все типы, используемые в методах и свойствах интерфейса.
-        /// </summary>
-        /// <param name="interfaceSymbol">Символ интерфейса для анализа</param>
-        /// <returns>Список директив UsingDirectiveSyntax для пространств имен, используемых в интерфейсе</returns>
+        // -------------------------------------------------------------------------
+        // Using extraction
+        // -------------------------------------------------------------------------
+
         private static List<UsingDirectiveSyntax> ExtractUsingsFromInterface(INamedTypeSymbol interfaceSymbol)
         {
             var usings = new HashSet<string>(StringComparer.Ordinal);
-
-            // Собираем все типы, которые используются в интерфейсе
             CollectTypesFromSymbol(interfaceSymbol, usings);
 
-            // Преобразуем в UsingDirectiveSyntax, удаляя дубликаты и системные пространства имен
             return usings
                 .Where(ns => !string.IsNullOrWhiteSpace(ns))
                 .Where(ns => !ns.StartsWith("System.") &&
@@ -158,75 +264,39 @@ namespace RefitControllerGenerator.CodeFixes
                 .ToList();
         }
 
-        /// <summary>
-        /// Рекурсивно собирает все пространства имен типов из символа интерфейса.
-        /// Обрабатывает методы, свойства, параметры и базовые интерфейсы.
-        /// </summary>
-        /// <param name="symbol">Символ типа (интерфейс) для анализа</param>
-        /// <param name="usings">Коллекция для накопления уникальных пространств имен</param>
         private static void CollectTypesFromSymbol(INamedTypeSymbol symbol, HashSet<string> usings)
         {
             if (symbol == null) return;
 
-            // Добавляем пространство имен самого интерфейса (но не добавляем его в using)
-            var interfaceNamespace = symbol.ContainingNamespace?.ToDisplayString();
-
-            // Собираем типы из методов
             foreach (var member in symbol.GetMembers().OfType<IMethodSymbol>())
             {
-                // Тип возвращаемого значения
                 AddTypeNamespace(member.ReturnType, usings);
-
-                // Типы параметров
                 foreach (var parameter in member.Parameters)
-                {
                     AddTypeNamespace(parameter.Type, usings);
-                }
-
-                // Типы generic параметров
                 foreach (var typeParam in member.TypeParameters)
-                {
                     foreach (var constraint in typeParam.ConstraintTypes)
-                    {
                         AddTypeNamespace(constraint, usings);
-                    }
-                }
             }
 
-            // Собираем типы из свойств
             foreach (var property in symbol.GetMembers().OfType<IPropertySymbol>())
-            {
                 AddTypeNamespace(property.Type, usings);
-            }
 
-            // Рекурсивно обрабатываем базовые интерфейсы
             foreach (var baseInterface in symbol.AllInterfaces)
-            {
                 CollectTypesFromSymbol(baseInterface, usings);
-            }
         }
 
-        /// <summary>
-        /// Добавляет пространство имен типа в коллекцию, если оно не является системным.
-        /// Рекурсивно обрабатывает массивы и generic типы.
-        /// </summary>
-        /// <param name="typeSymbol">Символ типа для анализа</param>
-        /// <param name="usings">Коллекция для добавления пространства имен</param>
         private static void AddTypeNamespace(ITypeSymbol typeSymbol, HashSet<string> usings)
         {
             if (typeSymbol == null) return;
 
-            // Обрабатываем массивные типы
             if (typeSymbol is IArrayTypeSymbol arrayType)
             {
                 AddTypeNamespace(arrayType.ElementType, usings);
                 return;
             }
 
-            // Обрабатываем generic типы
             if (typeSymbol is INamedTypeSymbol namedType)
             {
-                // Добавляем namespace основного типа
                 var ns = namedType.ContainingNamespace?.ToDisplayString();
                 if (!string.IsNullOrWhiteSpace(ns) &&
                     !ns.StartsWith("System") &&
@@ -235,15 +305,11 @@ namespace RefitControllerGenerator.CodeFixes
                     usings.Add(ns);
                 }
 
-                // Рекурсивно обрабатываем generic аргументы
                 foreach (var typeArg in namedType.TypeArguments)
-                {
                     AddTypeNamespace(typeArg, usings);
-                }
                 return;
             }
 
-            // Добавляем namespace простых типов
             var namespaceStr = typeSymbol.ContainingNamespace?.ToDisplayString();
             if (!string.IsNullOrWhiteSpace(namespaceStr) &&
                 !namespaceStr.StartsWith("System") &&
@@ -253,11 +319,10 @@ namespace RefitControllerGenerator.CodeFixes
             }
         }
 
-        /// <summary>
-        /// Извлекает базовый маршрут контроллера как самый длинный неповторяющийся маршрут из интерфейса Refit
-        /// </summary>
-        /// <param name="interfaceSymbol"></param>
-        /// <returns></returns>
+        // -------------------------------------------------------------------------
+        // Route helpers
+        // -------------------------------------------------------------------------
+
         private static string? TryGetBaseRoute(INamedTypeSymbol interfaceSymbol)
         {
             var routes = interfaceSymbol
@@ -278,64 +343,46 @@ namespace RefitControllerGenerator.CodeFixes
         {
             if (routes == null || routes.Count == 0) return null;
 
-            var segmentsList = routes
-                .Select(r => r.Split('/'))
-                .ToList();
-
+            var segmentsList = routes.Select(r => r.Split('/')).ToList();
             var firstSegments = segmentsList[0];
             var commonSegments = new List<string>();
 
             for (int i = 0; i < firstSegments.Length; i++)
             {
                 var segment = firstSegments[i];
-
-                // Пропускаем сегменты с параметрами типа {code}
-                if (segment.StartsWith("{"))
-                    break;
-
-                // Проверяем, что все маршруты совпадают на этом сегменте
+                if (segment.StartsWith("{")) break;
                 bool allMatch = segmentsList.All(s => i < s.Length && s[i] == segment);
-                if (!allMatch)
-                    break;
-
+                if (!allMatch) break;
                 commonSegments.Add(segment);
             }
 
             return commonSegments.Count > 0 ? string.Join("/", commonSegments) : null;
         }
 
-        private static SyntaxTriviaList ElasticBlankLine()
-        {
-            return SyntaxFactory.TriviaList(
-                SyntaxFactory.ElasticCarriageReturnLineFeed);
-        }
+        // -------------------------------------------------------------------------
+        // Class declaration
+        // -------------------------------------------------------------------------
 
-        /// <summary>
-        /// Создаёт декларацию класса контроллера, добавляет атрибуты, DI-поля, конструктор, XML-комментарии и сгенерированные методы
-        /// </summary>
-        /// <param name="controllerName"></param>
-        /// <param name="interfaceName"></param>
-        /// <param name="interfaceSymbol"></param>
-        /// <returns></returns>
-        private static ClassDeclarationSyntax GenerateControllerClass(string controllerName, string interfaceName, INamedTypeSymbol interfaceSymbol)
+        private static SyntaxTriviaList ElasticBlankLine()
+            => SyntaxFactory.TriviaList(SyntaxFactory.ElasticCarriageReturnLineFeed);
+
+        private static ClassDeclarationSyntax GenerateControllerClass(
+            string controllerName,
+            string interfaceName,
+            INamedTypeSymbol interfaceSymbol)
         {
             var serviceFieldName = GetServiceFieldName(interfaceName);
 
             var constructor = GenerateConstructor(controllerName, interfaceName);
-            // Добавляем комментарий к конструктору
             var constructorDocs = GenerateConstructorDocs(new[] { serviceFieldName, "logger" });
             if (constructorDocs.Count > 0)
-            {
                 constructor = constructor.WithLeadingTrivia(ElasticBlankLine().AddRange(constructorDocs));
-            }
 
             var serviceField = GenerateServiceField(interfaceName);
             var loggerField = GenerateLoggerField();
-
             var baseRoute = TryGetBaseRoute(interfaceSymbol) ?? "api/[controller]";
 
-            var routeAttr = SyntaxFactory.Attribute(
-                SyntaxFactory.IdentifierName("Route"))
+            var routeAttr = SyntaxFactory.Attribute(SyntaxFactory.IdentifierName("Route"))
                 .WithArgumentList(
                     SyntaxFactory.AttributeArgumentList(
                         SyntaxFactory.SingletonSeparatedList(
@@ -344,42 +391,36 @@ namespace RefitControllerGenerator.CodeFixes
                                     SyntaxKind.StringLiteralExpression,
                                     SyntaxFactory.Literal(baseRoute))))));
 
-
             var classDecl = SyntaxFactory.ClassDeclaration(controllerName)
                 .AddModifiers(SyntaxFactory.Token(SyntaxKind.PublicKeyword))
                 .AddBaseListTypes(
-                    SyntaxFactory.SimpleBaseType(
-                        SyntaxFactory.ParseTypeName("IdentityController")))
+                    SyntaxFactory.SimpleBaseType(SyntaxFactory.ParseTypeName("IdentityController")))
                 .AddAttributeLists(
                     SyntaxFactory.AttributeList(
                         SyntaxFactory.SingletonSeparatedList(
-                            SyntaxFactory.Attribute(
-                                SyntaxFactory.IdentifierName("ApiController")))),
+                            SyntaxFactory.Attribute(SyntaxFactory.IdentifierName("ApiController")))),
                     SyntaxFactory.AttributeList(
                         SyntaxFactory.SingletonSeparatedList(routeAttr)),
                     SyntaxFactory.AttributeList(
-                            SyntaxFactory.SingletonSeparatedList(
-                                SyntaxFactory.Attribute(
-                                    SyntaxFactory.IdentifierName("Authorize")))))
+                        SyntaxFactory.SingletonSeparatedList(
+                            SyntaxFactory.Attribute(SyntaxFactory.IdentifierName("Authorize")))))
                 .AddMembers(serviceField, loggerField)
                 .AddMembers(constructor)
                 .AddMembers(GenerateControllerMethods(interfaceSymbol, baseRoute));
 
             var docsTrivia = GenerateControllerDocs(interfaceSymbol);
             if (docsTrivia.Count > 0)
-            {
                 classDecl = classDecl.WithLeadingTrivia(docsTrivia);
-            }
 
             return classDecl;
         }
 
-        /// <summary>
-        /// Проходит по методам интерфейса и генерирует для каждого соответствующий метод контроллера
-        /// </summary>
-        /// <param name="interfaceSymbol"></param>
-        /// <returns></returns>
-        private static MemberDeclarationSyntax[] GenerateControllerMethods(INamedTypeSymbol interfaceSymbol, string baseRoute)
+        // -------------------------------------------------------------------------
+        // Method generation
+        // -------------------------------------------------------------------------
+
+        private static MemberDeclarationSyntax[] GenerateControllerMethods(
+            INamedTypeSymbol interfaceSymbol, string baseRoute)
         {
             return interfaceSymbol
                 .GetMembers()
@@ -389,11 +430,6 @@ namespace RefitControllerGenerator.CodeFixes
                 .ToArray();
         }
 
-        /// <summary>
-        /// Создаёт метод контроллера: атрибут HTTP, Produces, Authorize, тело метода и XML-комментарий
-        /// </summary>
-        /// <param name="method"></param>
-        /// <returns></returns>
         private static MethodDeclarationSyntax GenerateControllerMethod(IMethodSymbol method, string baseRoute)
         {
             var httpAttr = GetRefitHttpAttribute(method);
@@ -402,48 +438,37 @@ namespace RefitControllerGenerator.CodeFixes
 
             var returnType = GetActionResultReturnType(method.ReturnType);
 
-            var methodDecl =
-                SyntaxFactory.MethodDeclaration(
-                        returnType,
-                        method.Name)
-                    .AddModifiers(
-                        SyntaxFactory.Token(SyntaxKind.PublicKeyword),
-                        SyntaxFactory.Token(SyntaxKind.AsyncKeyword))
-                    .AddParameterListParameters(
-                        method.Parameters.Select(GenerateParameter).ToArray())
-                    .AddAttributeLists(
-                        GenerateHttpAttribute(httpMethod, route, baseRoute))
-                    .AddAttributeLists(
-                        GenerateProducesAttributes())
-                    .WithBody(GenerateMethodBody(httpMethod, method));
+            var methodDecl = SyntaxFactory.MethodDeclaration(returnType, method.Name)
+                .AddModifiers(
+                    SyntaxFactory.Token(SyntaxKind.PublicKeyword),
+                    SyntaxFactory.Token(SyntaxKind.AsyncKeyword))
+                .AddParameterListParameters(
+                    method.Parameters.Select(GenerateParameter).ToArray())
+                .AddAttributeLists(GenerateHttpAttribute(httpMethod, route, baseRoute))
+                .AddAttributeLists(GenerateProducesAttributes())
+                .WithBody(GenerateMethodBody(httpMethod, method));
 
             var docsTrivia = GenerateMethodDocs(method);
             if (docsTrivia.Count > 0)
-            {
                 methodDecl = methodDecl.WithLeadingTrivia(docsTrivia);
-            }
 
             return methodDecl;
         }
 
-        /// <summary>
-        /// Преобразует XML-комментарий интерфейса в комментарий контроллера, заменяя термин «Интерфейс» на «Контроллер»
-        /// </summary>
-        /// <param name="interfaceSymbol"></param>
-        /// <returns></returns>
+        // -------------------------------------------------------------------------
+        // XML documentation
+        // -------------------------------------------------------------------------
+
         private static SyntaxTriviaList GenerateControllerDocs(INamedTypeSymbol interfaceSymbol)
         {
             var xml = interfaceSymbol.GetDocumentationCommentXml();
             if (string.IsNullOrWhiteSpace(xml))
                 return default;
 
-            // Remove <doc> wrapper
             xml = xml.Replace("<doc>", "")
                      .Replace("</doc>", "")
-                     .Replace("Интерфейс", "Контроллер");
-
-            // Normalize line endings first
-            xml = xml.Replace("\r\n", "\n");
+                     .Replace("Интерфейс", "Контроллер")
+                     .Replace("\r\n", "\n");
 
             var lines = xml
                 .Split('\n')
@@ -451,22 +476,14 @@ namespace RefitControllerGenerator.CodeFixes
                 .Where(l => !string.IsNullOrEmpty(l))
                 .Select(l => "/// " + l);
 
-            var text = string.Join("\r\n", lines);
-
-            return SyntaxFactory.ParseLeadingTrivia(text + "\r\n");
+            return SyntaxFactory.ParseLeadingTrivia(string.Join("\r\n", lines) + "\r\n");
         }
 
-        /// <summary>
-        /// Формирует XML-комментарий для конструктора на основе списка параметров
-        /// </summary>
-        /// <param name="parameterNames"></param>
-        /// <returns></returns>
         private static SyntaxTriviaList GenerateConstructorDocs(IEnumerable<string> parameterNames)
         {
-            var indent = "    "; // 4 пробела для отступа внутри класса
+            var indent = "    ";
             var nl = Environment.NewLine;
 
-            // Строим текст комментария с правильными отступами
             var commentLines = new List<string>
             {
                 $"{indent}/// <summary>",
@@ -475,37 +492,22 @@ namespace RefitControllerGenerator.CodeFixes
             };
 
             foreach (var name in parameterNames)
-            {
                 commentLines.Add($"{indent}/// <param name=\"{name}\"></param>");
-            }
 
-            // Добавляем пустую строку после комментария
-            commentLines.Add(indent); // Просто отступ, будет воспринят как начало следующей строки
+            commentLines.Add(indent);
 
-            // Объединяем все строки
-            var commentText = string.Join(nl, commentLines);
-
-            // Парсим как ведущую тривию
-            return SyntaxFactory.ParseLeadingTrivia(commentText);
+            return SyntaxFactory.ParseLeadingTrivia(string.Join(nl, commentLines));
         }
 
-        /// <summary>
-        /// Очищает и форматирует XML-документацию метода интерфейса для вставки в контроллер
-        /// </summary>
-        /// <param name="symbol"></param>
-        /// <returns></returns>
         private static SyntaxTriviaList GenerateMethodDocs(ISymbol symbol)
         {
             var xml = symbol.GetDocumentationCommentXml();
             if (string.IsNullOrWhiteSpace(xml))
                 return default;
 
-            // Remove <doc> wrapper
             xml = xml.Replace("<doc>", "")
-                     .Replace("</doc>", "");
-
-            // Normalize line endings first
-            xml = xml.Replace("\r\n", "\n");
+                     .Replace("</doc>", "")
+                     .Replace("\r\n", "\n");
 
             var lines = xml
                 .Split('\n')
@@ -513,17 +515,13 @@ namespace RefitControllerGenerator.CodeFixes
                 .Where(l => !string.IsNullOrEmpty(l))
                 .Select(l => "/// " + l);
 
-            var text = string.Join("\r\n", lines);
-
-            return SyntaxFactory.ParseLeadingTrivia(text + "\r\n");
+            return SyntaxFactory.ParseLeadingTrivia(string.Join("\r\n", lines) + "\r\n");
         }
 
-        /// <summary>
-        /// Формирует один атрибут ProducesResponseType с кодом статуса и при необходимости с типом результата
-        /// </summary>
-        /// <param name="statusCode"></param>
-        /// <param name="type"></param>
-        /// <returns></returns>
+        // -------------------------------------------------------------------------
+        // Attribute helpers
+        // -------------------------------------------------------------------------
+
         private static AttributeSyntax CreateProduces(int statusCode, string? type = null)
         {
             var statusName = GetStatusCodeName(statusCode);
@@ -541,49 +539,25 @@ namespace RefitControllerGenerator.CodeFixes
             {
                 args.Add(
                     SyntaxFactory.AttributeArgument(
-                            SyntaxFactory.TypeOfExpression(
-                                SyntaxFactory.ParseTypeName(type)))
-                        .WithNameEquals(
-                            SyntaxFactory.NameEquals("Type")));
+                            SyntaxFactory.TypeOfExpression(SyntaxFactory.ParseTypeName(type)))
+                        .WithNameEquals(SyntaxFactory.NameEquals("Type")));
             }
 
             return SyntaxFactory.Attribute(SyntaxFactory.IdentifierName("ProducesResponseType"))
-                .WithArgumentList(
-                    SyntaxFactory.AttributeArgumentList(
-                        SyntaxFactory.SeparatedList(args)));
+                .WithArgumentList(SyntaxFactory.AttributeArgumentList(SyntaxFactory.SeparatedList(args)));
         }
 
-        /// <summary>
-        /// Генерирует набор атрибутов ProducesResponseType для стандартных HTTP-кодов
-        /// </summary>
-        /// <returns></returns>
         private static AttributeListSyntax[] GenerateProducesAttributes()
         {
             return new[]
             {
-                SyntaxFactory.AttributeList(
-                    SyntaxFactory.SingletonSeparatedList(
-                        CreateProduces(StatusCodes.Status200OK))),
-
-                SyntaxFactory.AttributeList(
-                    SyntaxFactory.SingletonSeparatedList(
-                        CreateProduces(StatusCodes.Status401Unauthorized))),
-
-                SyntaxFactory.AttributeList(
-                    SyntaxFactory.SingletonSeparatedList(
-                        CreateProduces(StatusCodes.Status400BadRequest, "ApiResult"))),
-
-                SyntaxFactory.AttributeList(
-                    SyntaxFactory.SingletonSeparatedList(
-                        CreateProduces(StatusCodes.Status500InternalServerError, "ApiResult")))
+                SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(CreateProduces(StatusCodes.Status200OK))),
+                SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(CreateProduces(StatusCodes.Status401Unauthorized))),
+                SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(CreateProduces(StatusCodes.Status400BadRequest, "ApiResult"))),
+                SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(CreateProduces(StatusCodes.Status500InternalServerError, "ApiResult")))
             };
         }
 
-        /// <summary>
-        /// Возвращает символьное имя HTTP-кода для использования в генерируемом синтаксисе.
-        /// </summary>
-        /// <param name="code"></param>
-        /// <returns></returns>
         private static string GetStatusCodeName(int code) => code switch
         {
             StatusCodes.Status200OK => "Status200OK",
@@ -593,18 +567,11 @@ namespace RefitControllerGenerator.CodeFixes
             _ => $"Status{code}"
         };
 
-        /// <summary>
-        /// Читает Refit-атрибут метода (Get, Post, и т.д.) и извлекает HTTP-метод и маршрут
-        /// </summary>
-        /// <param name="method"></param>
-        /// <returns></returns>
-        /// <exception cref="InvalidOperationException"></exception>
         private static (string httpMethod, string? route) GetRefitHttpAttribute(IMethodSymbol method)
         {
             foreach (var attr in method.GetAttributes())
             {
                 var name = attr.AttributeClass?.Name;
-
                 if (name is "GetAttribute" or "PostAttribute" or "DeleteAttribute" or "PutAttribute")
                 {
                     var httpMethod = name.Replace("Attribute", "").ToUpperInvariant();
@@ -616,12 +583,6 @@ namespace RefitControllerGenerator.CodeFixes
             throw new InvalidOperationException($"Method {method.Name} has no Refit HTTP attribute");
         }
 
-        /// <summary>
-        /// Создаёт атрибут Http… контроллера с маршрутом или без него (если маршрут пустой)
-        /// </summary>
-        /// <param name="method"></param>
-        /// <param name="route"></param>
-        /// <returns></returns>
         private static AttributeListSyntax GenerateHttpAttribute(string method, string? fullRoute, string? baseRoute)
         {
             var attrName = "Http" + method.Substring(0, 1) + method.Substring(1).ToLowerInvariant();
@@ -644,177 +605,144 @@ namespace RefitControllerGenerator.CodeFixes
                 }
             }
 
-            return SyntaxFactory.AttributeList(
-                SyntaxFactory.SingletonSeparatedList(attr));
+            return SyntaxFactory.AttributeList(SyntaxFactory.SingletonSeparatedList(attr));
         }
 
-        /// <summary>
-        /// Генерирует параметр метода контроллера на основе параметра интерфейса
-        /// </summary>
-        /// <param name="parameter"></param>
-        /// <returns></returns>
+        // -------------------------------------------------------------------------
+        // Parameter & return-type helpers
+        // -------------------------------------------------------------------------
+
         private static ParameterSyntax GenerateParameter(IParameterSymbol parameter)
         {
-            return SyntaxFactory.Parameter(
-                    SyntaxFactory.Identifier(parameter.Name))
-                .WithType(
-                    SyntaxFactory.ParseTypeName(
-                        parameter.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)));
+            return SyntaxFactory.Parameter(SyntaxFactory.Identifier(parameter.Name))
+                .WithType(SyntaxFactory.ParseTypeName(
+                    parameter.Type.ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat)));
         }
 
-        /// <summary>
-        /// Преобразует возвращаемый тип Task<T> в Task<ActionResult<T>> либо Task<IActionResult>
-        /// </summary>
-        /// <param name="returnType"></param>
-        /// <returns></returns>
         private static TypeSyntax GetActionResultReturnType(ITypeSymbol returnType)
         {
-            // Task<T>
             if (returnType is INamedTypeSymbol named &&
                 named.Name == "Task" &&
                 named.TypeArguments.Length == 1)
             {
-                var typeName =
-                    named.TypeArguments[0].ToDisplayString(
-                        SymbolDisplayFormat.MinimallyQualifiedFormat);
-
-                return SyntaxFactory.ParseTypeName(
-                    $"Task<ActionResult<{typeName}>>");
+                var typeName = named.TypeArguments[0]
+                    .ToDisplayString(SymbolDisplayFormat.MinimallyQualifiedFormat);
+                return SyntaxFactory.ParseTypeName($"Task<ActionResult<{typeName}>>");
             }
 
             return SyntaxFactory.ParseTypeName("Task<IActionResult>");
         }
 
-        private enum ResultKind
-        {
-            None,
-            SingleObject,
-            Collection
-        }
+        // -------------------------------------------------------------------------
+        // Method body
+        // -------------------------------------------------------------------------
+
+        private enum ResultKind { None, SingleObject, Collection }
 
         private static (ResultKind Kind, string? TypeName) AnalyzeResultType(IMethodSymbol method)
         {
             ITypeSymbol? type = method.ReturnType;
 
-            // Task<T>
-            if (type is INamedTypeSymbol taskType &&
-                taskType.Name == "Task" &&
-                taskType.TypeArguments.Length == 1)
-            {
+            if (type is INamedTypeSymbol taskType && taskType.Name == "Task" && taskType.TypeArguments.Length == 1)
                 type = taskType.TypeArguments[0];
-            }
 
-            // ActionResult<T>
             if (type is INamedTypeSymbol actionResultType &&
                 actionResultType.Name == "ActionResult" &&
                 actionResultType.TypeArguments.Length == 1)
             {
                 type = actionResultType.TypeArguments[0];
             }
-
-            if (type == null)
-                return (ResultKind.None, null);
-
-            // Коллекция
-            if (type is INamedTypeSymbol namedType &&
-                namedType.AllInterfaces.Any(i =>
-                    i.Name == "IEnumerable" &&
-                    i.TypeArguments.Length == 1))
+            else if (type is INamedTypeSymbol plainTask &&
+                     plainTask.Name == "Task" &&
+                     plainTask.TypeArguments.Length == 0)
             {
-                return (ResultKind.Collection, null);
+                return (ResultKind.None, null);
             }
 
-            // Примитив / string
-            if (IsPrimitiveOrSimpleType(type))
-                return (ResultKind.None, null);
+            if (type == null) return (ResultKind.None, null);
 
-            // Одиночный объект
+            if (type is INamedTypeSymbol namedType &&
+                namedType.AllInterfaces.Any(i => i.Name == "IEnumerable" && i.TypeArguments.Length == 1))
+                return (ResultKind.Collection, null);
+
+            if (IsPrimitiveOrSimpleType(type)) return (ResultKind.None, null);
+
             return (ResultKind.SingleObject, type.Name);
         }
 
-
-
-        /// <summary>
-        /// Формирует тело метода контроллера: логирование, вызов сервиса, try/catch, возврат результата
-        /// </summary>
-        /// <param name="method"></param>
-        /// <returns></returns>
         private static BlockSyntax GenerateMethodBody(string? httpMethod, IMethodSymbol method)
         {
             var serviceFieldName = GetServiceFieldName(method.ContainingType.Name);
-
             var callArgs = string.Join(", ", method.Parameters.Select(p => p.Name));
+
+            var isVoidTask = method.ReturnType is INamedTypeSymbol rt &&
+                             rt.Name == "Task" &&
+                             rt.TypeArguments.Length == 0;
+
+            if (isVoidTask)
+            {
+                var voidTryBody = SyntaxFactory.Block(
+                    SyntaxFactory.ParseStatement($"logger.Debug(\"Вызов метода {method.Name}\");")
+                        .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
+                    SyntaxFactory.ParseStatement($"await {serviceFieldName}.{method.Name}({callArgs});"),
+                    SyntaxFactory.ParseStatement("return Ok();"));
+
+                return SyntaxFactory.Block(
+                    SyntaxFactory.TryStatement()
+                        .WithBlock(voidTryBody)
+                        .WithCatches(SyntaxFactory.List(new[]
+                        {
+                            GenerateCatch("UnauthorizedAccessException", "return Unauthorized(e);"),
+                            GenerateCatch("ArgumentException", "return BadRequest(new ApiResult((int)HttpStatusCode.BadRequest, e.Message, e.Message));"),
+                            GenerateCatch("Exception", "return StatusCode((int)HttpStatusCode.InternalServerError, new ApiResult((int)HttpStatusCode.InternalServerError, e.Message, e.Message));")
+                        })));
+            }
 
             var serviceCall = SyntaxFactory.ParseStatement(
                 $"var result = await {serviceFieldName}.{method.Name}({callArgs});");
 
-            // Получаем имя возвращаемого типа для логирования
             var resultInfo = AnalyzeResultType(method);
 
-            // Определяем логику возврата результата в зависимости от HTTP метода
             StatementSyntax returnStatement = SyntaxFactory.IfStatement(
-                    SyntaxFactory.ParseExpression("result != null"),
+                SyntaxFactory.ParseExpression("result != null"),
+                SyntaxFactory.Block(
+                    SyntaxFactory.ParseStatement(
+                        resultInfo.Kind switch
+                        {
+                            ResultKind.SingleObject => $"logger.Debug(\"Успешно. {{@{resultInfo.TypeName}}}\", result);",
+                            ResultKind.Collection => "logger.Debug(\"Успешно. {Count} объектов\", result?.Count);",
+                            _ => "logger.Debug(\"Успешно\");"
+                        }).WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
+                    SyntaxFactory.ParseStatement("return Ok(result);")),
+                SyntaxFactory.ElseClause(
                     SyntaxFactory.Block(
-                        SyntaxFactory.ParseStatement(
-                            resultInfo.Kind switch
-                            {
-                                ResultKind.SingleObject =>
-                                    $"logger.Debug(\"Успешно. {{@{resultInfo.TypeName}}}\", result);",
-                                ResultKind.Collection =>
-                                    "logger.Debug(\"Успешно. {Count} объектов\", result?.Count);",
-                                _ =>
-                                    "logger.Debug(\"Успешно\");"
-                            })
-                           .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
-                           SyntaxFactory.ParseStatement("return Ok(result);")
-                    ),
-                    SyntaxFactory.ElseClause(
-                        SyntaxFactory.Block(
-                            SyntaxFactory.ParseStatement(
-                                $"logger.Error(\"Объект не найден\");")
+                        SyntaxFactory.ParseStatement("logger.Error(\"Объект не найден\");")
                             .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
-                            SyntaxFactory.ParseStatement(
-                                // Для GET методов: если результат не null - Ok, иначе - NotFound
-                                // Для других HTTP методов: если результат не null - Ok, иначе - BadRequest
-                                httpMethod != null && httpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase)
-                                ? "return NotFound();" : "return BadRequest();")
-                        )
-                    )
-                );
+                        SyntaxFactory.ParseStatement(
+                            httpMethod != null && httpMethod.Equals("GET", StringComparison.OrdinalIgnoreCase)
+                                ? "return NotFound();"
+                                : "return BadRequest();"))));
 
             var tryBody = SyntaxFactory.Block(
-                SyntaxFactory.ParseStatement(
-                    $"logger.Debug(\"Вызов метода {method.Name}\");").WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
+                SyntaxFactory.ParseStatement($"logger.Debug(\"Вызов метода {method.Name}\");")
+                    .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
                 serviceCall,
-                returnStatement
-            );
+                returnStatement);
 
             return SyntaxFactory.Block(
                 SyntaxFactory.TryStatement()
                     .WithBlock(tryBody)
-                    .WithCatches(
-                        SyntaxFactory.List(new[]
-                        {
-                            GenerateCatch(
-                                "UnauthorizedAccessException",
-                                "return Unauthorized(e);"),
-                            GenerateCatch(
-                                "ArgumentException",
-                                "return BadRequest(new ApiResult((int)HttpStatusCode.BadRequest, e.Message, e.Message));"),
-                            GenerateCatch(
-                                "Exception",
-                                "return StatusCode((int)HttpStatusCode.InternalServerError, new ApiResult((int)HttpStatusCode.InternalServerError, e.Message, e.Message));")
-                        }))
-            );
+                    .WithCatches(SyntaxFactory.List(new[]
+                    {
+                        GenerateCatch("UnauthorizedAccessException", "return Unauthorized(e);"),
+                        GenerateCatch("ArgumentException", "return BadRequest(new ApiResult((int)HttpStatusCode.BadRequest, e.Message, e.Message));"),
+                        GenerateCatch("Exception", "return StatusCode((int)HttpStatusCode.InternalServerError, new ApiResult((int)HttpStatusCode.InternalServerError, e.Message, e.Message));")
+                    })));
         }
 
         private static bool IsPrimitiveOrSimpleType(ITypeSymbol type)
         {
-            // Получаем специальные типы
-            var specialType = type.SpecialType;
-
-            // Проверяем, является ли тип примитивным (встроенным)
-            switch (specialType)
+            switch (type.SpecialType)
             {
                 case SpecialType.System_Object:
                 case SpecialType.System_Void:
@@ -838,31 +766,21 @@ namespace RefitControllerGenerator.CodeFixes
                     return true;
             }
 
-            // Проверяем, является ли тип Guid (часто используется как простой тип)
-            if (type.ToDisplayString() == "System.Guid")
-                return true;
+            if (type.ToDisplayString() == "System.Guid") return true;
+            if (type.TypeKind == TypeKind.Enum) return true;
 
-            // Проверяем, является ли тип enum
-            if (type.TypeKind == TypeKind.Enum)
-                return true;
-
-            // Проверяем, является ли тип nullable и его underlying type - примитив
             if (type is INamedTypeSymbol namedType &&
                 namedType.IsGenericType &&
                 namedType.ConstructedFrom.SpecialType == SpecialType.System_Nullable_T)
-            {
                 return IsPrimitiveOrSimpleType(namedType.TypeArguments[0]);
-            }
 
             return false;
         }
 
-        /// <summary>
-        /// Создаёт блок catch с логированием и соответствующим выражением возврата результата.
-        /// </summary>
-        /// <param name="exceptionType"></param>
-        /// <param name="returnStatement"></param>
-        /// <returns></returns>
+        // -------------------------------------------------------------------------
+        // Field & constructor generation
+        // -------------------------------------------------------------------------
+
         private static CatchClauseSyntax GenerateCatch(string exceptionType, string returnStatement)
         {
             return SyntaxFactory.CatchClause()
@@ -872,18 +790,11 @@ namespace RefitControllerGenerator.CodeFixes
                         SyntaxFactory.Identifier("e")))
                 .WithBlock(
                     SyntaxFactory.Block(
-                        SyntaxFactory.ParseStatement(
-                            $"logger.Error($\"{{e.Message}} {{e}}\");")
-                        .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
+                        SyntaxFactory.ParseStatement($"logger.Error($\"{{e.Message}} {{e}}\");")
+                            .WithTrailingTrivia(SyntaxFactory.CarriageReturnLineFeed),
                         SyntaxFactory.ParseStatement(returnStatement)));
         }
 
-        /// <summary>
-        /// Генерирует DI-конструктор, присваивающий сервис и логгер в поля
-        /// </summary>
-        /// <param name="controllerName"></param>
-        /// <param name="interfaceName"></param>
-        /// <returns></returns>
         private static ConstructorDeclarationSyntax GenerateConstructor(string controllerName, string interfaceName)
         {
             var fieldName = GetServiceFieldName(interfaceName);
@@ -891,11 +802,9 @@ namespace RefitControllerGenerator.CodeFixes
             return SyntaxFactory.ConstructorDeclaration(controllerName)
                 .AddModifiers(SyntaxFactory.Token(SyntaxKind.PublicKeyword))
                 .AddParameterListParameters(
-                    SyntaxFactory.Parameter(
-                            SyntaxFactory.Identifier(fieldName))
+                    SyntaxFactory.Parameter(SyntaxFactory.Identifier(fieldName))
                         .WithType(SyntaxFactory.ParseTypeName(interfaceName)),
-                    SyntaxFactory.Parameter(
-                            SyntaxFactory.Identifier("logger"))
+                    SyntaxFactory.Parameter(SyntaxFactory.Identifier("logger"))
                         .WithType(SyntaxFactory.ParseTypeName("ITraceableLogger")))
                 .WithBody(
                     SyntaxFactory.Block(
@@ -914,21 +823,14 @@ namespace RefitControllerGenerator.CodeFixes
                                     SyntaxKind.SimpleMemberAccessExpression,
                                     SyntaxFactory.ThisExpression(),
                                     SyntaxFactory.IdentifierName("logger")),
-                                SyntaxFactory.IdentifierName("logger")))
-                    ));
+                                SyntaxFactory.IdentifierName("logger")))));
         }
 
-        /// <summary>
-        /// Создаёт приватное readonly-поле логгера
-        /// </summary>
-        /// <returns></returns>
         private static FieldDeclarationSyntax GenerateLoggerField()
         {
-            var field = SyntaxFactory.FieldDeclaration(
-                    SyntaxFactory.VariableDeclaration(
-                        SyntaxFactory.ParseTypeName("ITraceableLogger"))
-                    .AddVariables(
-                        SyntaxFactory.VariableDeclarator("logger")))
+            return SyntaxFactory.FieldDeclaration(
+                    SyntaxFactory.VariableDeclaration(SyntaxFactory.ParseTypeName("ITraceableLogger"))
+                    .AddVariables(SyntaxFactory.VariableDeclarator("logger")))
                 .AddModifiers(
                     SyntaxFactory.Token(SyntaxKind.PrivateKeyword),
                     SyntaxFactory.Token(SyntaxKind.ReadOnlyKeyword))
@@ -936,69 +838,41 @@ namespace RefitControllerGenerator.CodeFixes
                     SyntaxFactory.TriviaList(
                         SyntaxFactory.CarriageReturnLineFeed,
                         SyntaxFactory.CarriageReturnLineFeed));
-            return field;
         }
 
-        /// <summary>
-        /// Создаёт приватное readonly-поле сервиса.
-        /// </summary>
-        /// <param name="interfaceName"></param>
-        /// <returns></returns>
         private static FieldDeclarationSyntax GenerateServiceField(string interfaceName)
         {
             var fieldName = GetServiceFieldName(interfaceName);
 
             return SyntaxFactory.FieldDeclaration(
-                    SyntaxFactory.VariableDeclaration(
-                        SyntaxFactory.ParseTypeName(interfaceName))
-                    .AddVariables(
-                        SyntaxFactory.VariableDeclarator(fieldName)))
+                    SyntaxFactory.VariableDeclaration(SyntaxFactory.ParseTypeName(interfaceName))
+                    .AddVariables(SyntaxFactory.VariableDeclarator(fieldName)))
                 .AddModifiers(
                     SyntaxFactory.Token(SyntaxKind.PrivateKeyword),
                     SyntaxFactory.Token(SyntaxKind.ReadOnlyKeyword));
         }
 
-        /// <summary>
-        /// Формирует имя DI-поля сервиса по имени интерфейса (ITasks → tasksService)
-        /// </summary>
-        /// <param name="interfaceName"></param>
-        /// <returns></returns>
+        // -------------------------------------------------------------------------
+        // Name helpers
+        // -------------------------------------------------------------------------
+
         private static string GetServiceFieldName(string interfaceName)
         {
-            var name = interfaceName.StartsWith("I")
-                    ? interfaceName.Substring(1)
-                    : interfaceName;
-
+            var name = interfaceName.StartsWith("I") ? interfaceName.Substring(1) : interfaceName;
             if (name.EndsWith("Api", StringComparison.OrdinalIgnoreCase))
                 name = name.Substring(0, name.Length - 3);
-
             return char.ToLowerInvariant(name[0]) + name.Substring(1) + "Service";
         }
 
-        /// <summary>
-        /// Строит имя контроллера на основе интерфейса (ITasks → TasksController)
-        /// </summary>
-        /// <param name="interfaceName"></param>
-        /// <returns></returns>
         private static string GetControllerName(string interfaceName)
         {
-            var name = interfaceName.StartsWith("I")
-                ? interfaceName.Substring(1)
-                : interfaceName;
-
+            var name = interfaceName.StartsWith("I") ? interfaceName.Substring(1) : interfaceName;
             if (name.EndsWith("Api", StringComparison.OrdinalIgnoreCase))
                 name = name.Substring(0, name.Length - 3);
-
             return name + "Controller";
         }
 
-        /// <summary>
-        /// Определяет пространство имён контроллеров по имени проекта
-        /// </summary>
-        /// <param name="document"></param>
-        /// <returns></returns>
         private static string GetControllersNamespace(Document document)
             => $"{document.Project.Name}.Controllers";
-
     }
 }
